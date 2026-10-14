@@ -1,129 +1,85 @@
-import sys
-from bank_system.data import create_account, get_sample_accounts
-from bank_system.processors import (
-    build_account_index, find_account, 
-    create_min_balance_filter, filter_accounts, universal_sort
-)
-from bank_system.analytics import (
-    group_accounts_by_type, calculate_total_balance,
-    get_average_balance, get_max_balance_account,
-    get_account_type_stats, add_to_history, get_history
-)
+import time
+import tracemalloc
+import os
+from itertools import islice, groupby, accumulate, pairwise, chain
 
-def display_menu() -> None:
-    print("\n=== СИСТЕМА БАНКІВСЬКИХ РАХУНКІВ ===")
-    print("1. Створити новий рахунок (**kwargs)")
-    print("2. Поповнити / Списати кошти")
-    print("3. Знайти рахунок (Dict index)")
-    print("4. Переглянути загальну статистику (*args, Generator)")
-    print("5. Статистика типів рахунків (Counter)")
-    print("6. Фільтрація за мін. балансом (Closure)")
-    print("7. Універсальне сортування (за будь-яким полем)")
-    print("8. Переглянути історію останніх операцій (deque)")
-    print("9. Вийти з програми")
+from bank_system.streaming import generate_large_dataset, run_lazy_pipeline
 
-def main() -> None:
-    accounts = get_sample_accounts()
+DATA_PATH = os.path.join("data", "input.csv")
 
-    while True:
-        display_menu()
-        choice = input("Оберіть дію (1-9): ").strip()
+def measure_eager_processing(filepath: str):
+    """Eager evaluation: завантаження всього файлу в пам'ять (наприклад, через pandas)."""
+    import pandas as pd
+    start_time = time.time()
+    tracemalloc.start()
+    
+    df = pd.read_csv(filepath)
+    df = df[(df["balance"] >= 0) & (df["amount"] >= 0)]
+    df["balance"] = df.apply(
+        lambda row: row["balance"] + row["amount"] if row["operation"] == "deposit" 
+        else (row["balance"] - row["amount"] if row["balance"] - row["amount"] >= 0 else row["balance"]), 
+        axis=1
+    )
+    total_sum = df["balance"].sum()
+    
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    elapsed = time.time() - start_time
+    return elapsed, peak, total_sum
 
-        if choice == "1":
-            acc_num = input("Номер рахунку: ").strip()
-            owner = input("ПІБ власника: ").strip()
-            acc_type = input("Тип (Checking/Savings/Credit/Deposit): ").strip()
-            try:
-                initial_bal = float(input("Початковий баланс: "))
-                new_acc = create_account(
-                    account_number=acc_num, 
-                    client_name=owner, 
-                    balance=initial_bal, 
-                    account_type=acc_type
-                )
-                accounts.append(new_acc)
-                add_to_history(f"Створено рахунок {acc_num} ({owner})")
-                print(f"Створено рахунок {acc_num}!")
-            except ValueError as err:
-                print(f"Помилка: {err}")
 
-        elif choice == "2":
-            acc_num = input("Введіть номер рахунку: ").strip()
-            index = build_account_index(accounts)
-            acc = find_account(index, acc_num)
-            if not acc:
-                print("Рахунок не знайдено.")
-                continue
-            
-            action = input("1 - Поповнити, 2 - Списати: ").strip()
-            try:
-                amount = float(input("Сума: "))
-                if action == "1":
-                    acc['balance'] += amount
-                    add_to_history(f"Поповнення {acc_num} на {amount} грн")
-                    print(f"Новий баланс: {acc['balance']:.2f} грн")
-                elif action == "2":
-                    if acc['balance'] < amount:
-                        print("Недостатньо коштів.")
-                    else:
-                        acc['balance'] -= amount
-                        add_to_history(f"Списання {acc_num} на {amount} грн")
-                        print(f"Новий баланс: {acc['balance']:.2f} грн")
-            except ValueError:
-                print("Некоректне число.")
+def measure_lazy_processing(filepath: str):
+    """Lazy evaluation: потокова обробка без матеріалізації колекцій."""
+    start_time = time.time()
+    tracemalloc.start()
+    
+    pipeline = run_lazy_pipeline(filepath, min_balance=100.0)
+    total_sum = sum(rec["balance"] for rec in pipeline)
+    
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    elapsed = time.time() - start_time
+    return elapsed, peak, total_sum
 
-        elif choice == "3":
-            query = input("Введіть номер або ім'я: ").strip()
-            index = build_account_index(accounts)
-            found = find_account(index, query)
-            if found:
-                print(f"Знайдено: {found['account_number']} | {found['client_name']} | {found['balance']} грн")
-            else:
-                print("Нічого не знайдено.")
-
-        elif choice == "4":
-            total = calculate_total_balance(*(a["balance"] for a in accounts))
-            avg = get_average_balance(accounts)
-            max_acc = get_max_balance_account(accounts)
-            print(f"\nЗагальна сума: {total:.2f} грн")
-            print(f"Середній баланс: {avg:.2f} грн")
-            print(f"Найбільший баланс: {max_acc.get('client_name')} ({max_acc.get('balance')} грн)")
-
-        elif choice == "5":
-            stats = get_account_type_stats(accounts)
-            print("\nКількість рахунків за типами (Counter):")
-            for acc_type, count in stats.items():
-                print(f" - {acc_type}: {count}")
-
-        elif choice == "6":
-            try:
-                min_val = float(input("Мінімальний баланс: "))
-                min_filter = create_min_balance_filter(min_val)
-                filtered = filter_accounts(accounts, min_filter)
-                print(f"Знайдено {len(filtered)} рахунків:")
-                for a in filtered:
-                    print(f" - {a['client_name']}: {a['balance']} грн")
-            except ValueError:
-                print("Некоректне число.")
-
-        elif choice == "7":
-            field = input("Введіть поле для сортування (balance / client_name / account_type): ").strip()
-            sorted_accs = universal_sort(accounts, key=field, reverse=True)
-            print(f"\nСортування за полем '{field}':")
-            for a in sorted_accs:
-                print(f" - {a['client_name']} ({a['account_type']}): {a['balance']} грн")
-
-        elif choice == "8":
-            history = get_history()
-            print("\nІсторія останніх операцій (до 5 дій):")
-            if not history:
-                print("Історія порожня.")
-            for i, h in enumerate(history, 1):
-                print(f"{i}. {h}")
-
-        elif choice == "9":
-            print("Вихід з програми.")
-            sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    print("=== БАНКІВСЬКА СИСТЕМА: ПОТОКОВА ОБРОБКА ДАНИХ (ЛР №3) ===")
+    
+    # 1. Генерація датасету (100 000+ записів)
+    print("[1] Генерація тестового набору даних (100 000 записів)...")
+    generate_large_dataset(DATA_PATH, total_records=100_000)
+    print(f"   Файл створено: {DATA_PATH} (розмір: {os.path.getsize(DATA_PATH) / 1024 / 1024:.2f} MB)\n")
+
+    # 2. Вибірка перших записів через islice
+    print("[2] Демонстрація роботи lazy pipeline та вибірки перших 5 записів (islice):")
+    pipeline = run_lazy_pipeline(DATA_PATH)
+    first_records = list(islice(pipeline, 5))
+    for idx, rec in enumerate(first_records, 1):
+        print(f"   {idx}. Рахунок: {rec['account_number']} | Клієнт: {rec['client']} | Баланс: {rec['balance']} | Операція: {rec['operation']} {rec['amount']}")
+    print()
+
+    # 3. Використання itertools (groupby, accumulate, pairwise, chain)
+    print("[3] Демонстрація інструментів itertools:")
+    pipeline_it = run_lazy_pipeline(DATA_PATH)
+    rec_list = sorted(list(pipeline_it), key=lambda x: x["client"])
+    
+    # groupby
+    client_groups = {client: len(list(group)) for client, group in groupby(rec_list, key=lambda x: x["client"])}
+    print(f"   Кількість записів по клієнтах (groupby): {client_groups}")
+
+    # accumulate та pairwise
+    balances = [r["balance"] for r in rec_list[:10]]
+    acc_balances = list(accumulate(balances))
+    diffs = [round(curr - prev, 2) for prev, curr in pairwise(balances)]
+    print(f"   Накопичувальні баланси (accumulate): {acc_balances[:5]}")
+    print(f"   Різниці сусідніх транзакцій (pairwise): {diffs[:5]}")
+    print()
+
+    # 4. Порівняння Eager та Lazy підходів
+    print("[4] Порівняння продуктивності (Eager vs Lazy):")
+    eager_time, eager_peak, eager_sum = measure_eager_processing(DATA_PATH)
+    lazy_time, lazy_peak, lazy_sum = measure_lazy_processing(DATA_PATH)
+
+    print(f"   [Eager] Час: {eager_time:.4f} сек | Пікова пам'ять: {eager_peak / 1024 / 1024:.2f} MB | Сума: {eager_sum}")
+    print(f"   [Lazy]  Час: {lazy_time:.4f} сек | Пікова пам'ять: {lazy_peak / 1024 / 1024:.2f} MB | Сума: {lazy_sum}")
+    print("\nВиконання програми завершено успішно!")
